@@ -30,6 +30,51 @@ class GeminiProvider(BaseLLMProvider):
 
     supports_tools = True
 
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 1000,
+        top_p: float = 0.9,
+        timeout: int = 30,
+        fallback_models: Optional[List[str]] = None,
+        **kwargs,
+    ):
+        self.fallback_models: List[str] = list(fallback_models or [])
+        super().__init__(
+            api_key=api_key,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            timeout=timeout,
+            **kwargs,
+        )
+        from .model_health import register_model
+        register_model(self.model)
+        for m in self.fallback_models:
+            register_model(m)
+
+    def candidate_models(self, preferred_model: Optional[str] = None) -> List[str]:
+        """Return candidate models in order of preference, filtering out cooling models."""
+        from .model_health import is_available, register_model
+
+        if preferred_model:
+            all_models = [preferred_model] + [
+                m for m in ([self.model] + self.fallback_models) if m != preferred_model
+            ]
+        else:
+            all_models = [self.model] + self.fallback_models
+
+        for m in all_models:
+            register_model(m)
+
+        available = [m for m in all_models if is_available(m)]
+        if not available:
+            return list(all_models)
+        return available
+
     def validate_config(self) -> None:
         if not self.api_key:
             raise ValueError("Google API key is required")
@@ -90,8 +135,9 @@ class GeminiProvider(BaseLLMProvider):
 
     def _config(
         self,
-        system_prompt: Optional[str],
-        tools: Optional[List[ToolSpec]],
+        system_prompt: Optional[str] = None,
+        tools: Optional[List[ToolSpec]] = None,
+        tool_choice: Optional[str] = None,
     ) -> types.GenerateContentConfig:
         kwargs: Dict[str, Any] = {
             "temperature": self.temperature,
@@ -128,6 +174,10 @@ class GeminiProvider(BaseLLMProvider):
             # explicitly rather than relied upon to stay inactive.
             kwargs["automatic_function_calling"] = (
                 types.AutomaticFunctionCallingConfig(disable=True)
+            )
+        if tool_choice == "none":
+            kwargs["tool_config"] = types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="NONE")
             )
         return types.GenerateContentConfig(**kwargs)
 
@@ -175,49 +225,60 @@ class GeminiProvider(BaseLLMProvider):
         messages: List[Message],
         system_prompt: Optional[str] = None,
         tools: Optional[List[ToolSpec]] = None,
+        model: Optional[str] = None,
+        tool_choice: Optional[str] = None,
         **kwargs,
     ) -> LLMResponse:
+        target_model = model or self.model
+        tc = tool_choice if tool_choice is not None else kwargs.get("tool_choice")
         try:
             contents = self._to_contents(messages)
             logger.debug(
-                "Gemini request: %d turns, tools=%s",
+                "Gemini request (%s): %d turns, tools=%s",
+                target_model,
                 len(contents),
                 [t.name for t in tools] if tools else None,
             )
 
             response = self.client.models.generate_content(
-                model=self.model,
+                model=target_model,
                 contents=contents,
-                config=self._config(system_prompt, tools),
+                config=self._config(system_prompt, tools, tool_choice=tc),
             )
 
             text, tool_calls = self._parse(response)
 
             usage = getattr(response, "usage_metadata", None)
             tokens = getattr(usage, "total_token_count", None) if usage else None
+            cached_tokens = (
+                getattr(usage, "cached_content_token_count", None) if usage else None
+            )
 
             if tool_calls:
                 logger.info(
-                    "Gemini requested %d tool call(s): %s",
+                    "Gemini (%s) requested %d tool call(s): %s",
+                    target_model,
                     len(tool_calls),
                     [tc.name for tc in tool_calls],
                 )
                 return LLMResponse(
                     content=text,
-                    model=self.model,
+                    model=target_model,
                     provider="gemini",
                     tokens_used=tokens,
                     finish_reason="tool_calls",
                     tool_calls=tool_calls,
+                    cached_tokens=cached_tokens,
                 )
 
             if text:
                 return LLMResponse(
                     content=text,
-                    model=self.model,
+                    model=target_model,
                     provider="gemini",
                     tokens_used=tokens,
                     finish_reason="stop",
+                    cached_tokens=cached_tokens,
                 )
 
             # No text and no tool call usually means a safety block or an empty
@@ -225,18 +286,19 @@ class GeminiProvider(BaseLLMProvider):
             reason = None
             if getattr(response, "candidates", None):
                 reason = getattr(response.candidates[0], "finish_reason", None)
-            logger.warning("Empty Gemini response (finish_reason=%s)", reason)
+            logger.warning("Empty Gemini response (%s) (finish_reason=%s)", target_model, reason)
             return LLMResponse(
                 content="I couldn't generate a response. Please try again.",
-                model=self.model,
+                model=target_model,
                 provider="gemini",
                 finish_reason="error",
                 error=f"Empty response (finish_reason={reason})",
+                cached_tokens=cached_tokens,
             )
 
         except Exception as e:
-            logger.error(f"Gemini error: {e}", exc_info=True)
-            return self._handle_error(e, "generate_response")
+            logger.error("Gemini error with model %s: %s", target_model, e, exc_info=True)
+            raise
 
     async def stream_response(
         self,

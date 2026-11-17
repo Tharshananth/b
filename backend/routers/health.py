@@ -6,7 +6,10 @@ from typing import Dict
 import logging
 from datetime import datetime
 from llm.factory import get_llm_factory
+from llm.model_health import status as model_health_status
 from vector_db.retriever import get_retriever
+from memory import get_memory_store
+from prompts.loader import prompt_version
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/health", tags=["Health"])
@@ -47,7 +50,10 @@ async def health_check() -> Dict:
             },
             "metrics": {
                 "documents_indexed": doc_count
-            }
+            },
+            "llm_models": model_health_status(),
+            "memory": get_memory_store().status(),
+            "prompt_version": prompt_version(),
         }
     except Exception as e:
         logger.error(f"Health check error: {e}")

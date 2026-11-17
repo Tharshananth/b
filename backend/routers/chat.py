@@ -12,6 +12,8 @@ stalling the event loop for every other request in flight.
 import json
 import logging
 import uuid
+import concurrent.futures
+import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -19,43 +21,43 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
-from config import get_conversation_memory_config, get_security_config
-from database import DataAccessLog, FeedbackInteraction, get_db
+from config import (
+    get_conversation_memory_config,
+    get_security_config,
+    get_guardrails_config,
+    get_citations_config,
+    get_fast_path_config,
+    get_performance_config,
+)
+from database import DataAccessLog, FeedbackInteraction, GuardrailEvent, RequestMetric, SessionLocal, get_db
+from fast_path import match_greeting
 from llm.base import Message
+from auth.dependencies import require_admin
+from memory import get_memory_store, trim
+from guardrails import get_medical_guardrail, GuardrailDecision
 from services import orchestrator, suggestions
+from services.citations import verify_citations
 from services.job_status import ScopeViolation, TenantScope
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["Chat"])
 
+_chat_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8,
+    thread_name_prefix="chat_worker",
+)
+
 
 # ── Conversation memory ─────────────────────────────────────────────────────
-# Stores the full Message list, tool turns included. A tool exchange is four
-# messages (question, the model's tool request, the result, the answer) and all
-# four have to survive into the next turn - otherwise a follow-up like "and why
-# did that one fail?" reaches a model that has forgotten it ever ran a lookup.
-#
-# Still process-local, so it does not survive a restart and does not work
-# across multiple workers. Redis is the eventual home.
-session_memories: Dict[str, List[Message]] = {}
-
-
 def _load_history(session_id: str) -> List[Message]:
     """Recent turns for a session, trimmed to the configured window."""
-    history = session_memories.get(session_id, [])
     k = get_conversation_memory_config().buffer_window.k
-
-    # Count complete exchanges from the end, keeping tool turns attached to the
-    # user turn they belong to. Cutting between a tool request and its result
-    # would leave a dangling call that every provider rejects.
-    starts = [i for i, m in enumerate(history) if m.role == "user"]
-    if len(starts) > k:
-        return history[starts[-k]:]
-    return history
+    history = get_memory_store().load(session_id)
+    return trim(history, k)
 
 
 def _save_history(session_id: str, messages: List[Message]) -> None:
-    session_memories[session_id] = messages
+    get_memory_store().save(session_id, messages)
 
 
 # ── Scope resolution ────────────────────────────────────────────────────────
@@ -115,6 +117,7 @@ class Source(BaseModel):
     title: str
     url: str
     content: str
+    page: Optional[int] = None
 
 
 class ToolUse(BaseModel):
@@ -146,6 +149,7 @@ class ChatResponse(BaseModel):
     react_steps: List[ReActStepModel] = []
     suggestions: List[str] = []
     scoped: bool = False
+    guardrail: Optional[str] = None
 
 
 class ErrorResponse(BaseModel):
@@ -192,10 +196,135 @@ def _write_audit(db: Session, *, result, scope: Optional[TenantScope],
         db.rollback()
 
 
+# ── Guardrail event logger ───────────────────────────────────────────────────
+def _log_guardrail_event(
+    db: Session,
+    *,
+    session_id: str,
+    user_id: str,
+    message_id: str,
+    decision: "GuardrailDecision",
+    model: str,
+) -> None:
+    """Write one GuardrailEvent row best-effort. Never raises."""
+    try:
+        if decision.error:
+            decision_str = "error"
+        elif decision.blocked:
+            decision_str = "blocked"
+        else:
+            decision_str = "allowed"
+        db.add(GuardrailEvent(
+            session_id=session_id,
+            user_id=user_id,
+            message_id=message_id,
+            stage=decision.stage,
+            category=decision.category,
+            decision=decision_str,
+            reason=decision.reason,
+            latency_ms=decision.latency_ms,
+            model=model,
+            error=decision.error,
+        ))
+        db.commit()
+    except Exception as exc:
+        logger.error("GuardrailEvent write failed: %s", exc)
+        db.rollback()
+
+
+# ── Background agent callback (parallel mode) ────────────────────────────────
+def _attach_background_agent_callback(
+    fut,
+    *,
+    scope: Optional[TenantScope],
+    user_id: str,
+    session_id: str,
+    message_id: str,
+) -> None:
+    """
+    Handle background agent completion when guardrail blocked or routed.
+    Opens its own DB session, writes audit, logs CRITICAL on ScopeViolation, never raises.
+    """
+    def _done_cb(f):
+        db_bg = SessionLocal()
+        try:
+            try:
+                res = f.result()
+                _write_audit(
+                    db_bg,
+                    result=res,
+                    scope=scope,
+                    user_id=user_id,
+                    session_id=session_id,
+                    message_id=message_id,
+                )
+            except ScopeViolation as sve:
+                logger.critical("SCOPE VIOLATION on session %s: %s", session_id, sve)
+            except Exception as bg_e:
+                logger.error("Background agent execution failed: %s", bg_e, exc_info=True)
+        except Exception as outer_e:
+            logger.error("Error in background agent callback: %s", outer_e)
+        finally:
+            db_bg.close()
+
+    fut.add_done_callback(_done_cb)
+
+
+# ── Request metric logger ───────────────────────────────────────────────────
+def _write_metric(
+    db: Session,
+    *,
+    message_id: str,
+    session_id: str,
+    path: str,
+    total_ms: float,
+    guardrail_ms: Optional[float] = None,
+    agent_ms: Optional[float] = None,
+    llm_calls: int = 0,
+    agent_rounds: int = 0,
+    tokens: Optional[int] = None,
+    cached_tokens: Optional[int] = None,
+    provider: Optional[str] = None,
+    model_used: Optional[str] = None,
+    parallel: bool = False,
+) -> None:
+    """Write exactly one RequestMetric row best-effort. Never raises."""
+    p_ver = None
+    try:
+        from prompts.loader import prompt_version
+        p_ver = prompt_version()
+    except Exception:
+        p_ver = None
+
+    try:
+        metric = RequestMetric(
+            message_id=message_id,
+            session_id=session_id,
+            path=path,
+            total_ms=round(total_ms, 2),
+            guardrail_ms=round(guardrail_ms, 2) if guardrail_ms is not None else None,
+            agent_ms=round(agent_ms, 2) if agent_ms is not None else None,
+            llm_calls=llm_calls,
+            agent_rounds=agent_rounds,
+            tokens=tokens,
+            cached_tokens=cached_tokens,
+            provider=provider,
+            model_used=model_used,
+            prompt_version=p_ver,
+            parallel=parallel,
+        )
+        db.add(metric)
+        db.commit()
+    except Exception as exc:
+        logger.error("Failed to write RequestMetric: %s", exc)
+        db.rollback()
+
+
 # ── Endpoint ────────────────────────────────────────────────────────────────
 @router.post("/", response_model=ChatResponse, responses={500: {"model": ErrorResponse}})
 def chat(request: ChatRequest, db: Session = Depends(get_db)):
     """Answer one message, using the knowledge base and job database as needed."""
+    start_time = time.perf_counter()
     session_id = request.session_id or f"session_{uuid.uuid4().hex[:12]}"
     user_id = request.user_id or "anonymous"
     message_id = f"msg_{uuid.uuid4().hex[:12]}"
@@ -205,8 +334,80 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
     scope = _resolve_scope(request)
     history = _load_history(session_id)
 
-    try:
-        result = orchestrator.run(
+    # ── Step 1: Fast-path instant greetings (no LLM, no guardrail) ───────────
+    fast_path_cfg = get_fast_path_config()
+    if fast_path_cfg.enabled:
+        kind = match_greeting(request.message)
+        if kind:
+            reply_text = getattr(fast_path_cfg.replies, kind, fast_path_cfg.replies.greeting)
+            _save_history(
+                session_id,
+                history + [
+                    Message(role="user", content=request.message),
+                    Message(role="assistant", content=reply_text),
+                ],
+            )
+            try:
+                db.add(FeedbackInteraction(
+                    user_id=user_id,
+                    session_id=session_id,
+                    message_id=message_id,
+                    timestamp=datetime.utcnow(),
+                    question=request.message,
+                    response=reply_text,
+                    provider_used="fast_path",
+                    tokens_used=None,
+                ))
+                db.commit()
+            except Exception as exc:
+                logger.error("Failed to save fast_path interaction: %s", exc, exc_info=True)
+                db.rollback()
+
+            total_ms = (time.perf_counter() - start_time) * 1000.0
+            _write_metric(
+                db,
+                message_id=message_id,
+                session_id=session_id,
+                path="fast_path",
+                total_ms=total_ms,
+                guardrail_ms=None,
+                agent_ms=None,
+                llm_calls=0,
+                agent_rounds=0,
+                tokens=None,
+                cached_tokens=None,
+                provider="fast_path",
+                model_used=None,
+                parallel=False,
+            )
+
+            return ChatResponse(
+                response=reply_text,
+                sources=[],
+                session_id=session_id,
+                message_id=message_id,
+                success=True,
+                provider_used="fast_path",
+                tokens_used=None,
+                tools_used=[],
+                react_steps=[],
+                suggestions=[],
+                scoped=scope is not None,
+                guardrail=None,
+            )
+
+    gr_cfg = get_guardrails_config().medical
+    is_parallel = bool(get_performance_config().parallel_gatekeeper and gr_cfg.enabled)
+    input_decision: Optional[GuardrailDecision] = None
+    result = None
+
+    if is_parallel:
+        # Submit both guardrail and agent concurrently
+        guardrail_future = _chat_executor.submit(
+            get_medical_guardrail().check_input, request.message, history
+        )
+        agent_future = _chat_executor.submit(
+            orchestrator.run,
             user_message=request.message,
             scope=scope,
             history=history,
@@ -214,23 +415,396 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
             session_id=session_id,
             user_id=user_id,
         )
-    except ScopeViolation as e:
-        # The database returned data outside the caller's scope. Never dress
-        # this up as a normal error - fail hard and loudly.
-        logger.critical("SCOPE VIOLATION on session %s: %s", session_id, e)
-        raise HTTPException(
-            status_code=500,
-            detail="A data access check failed. This request was blocked.",
+
+        input_decision = guardrail_future.result()
+        _log_guardrail_event(
+            db,
+            session_id=session_id,
+            user_id=user_id,
+            message_id=message_id,
+            decision=input_decision,
+            model=input_decision.model or gr_cfg.model,
         )
 
+        if input_decision.blocked:
+            canned = gr_cfg.canned_response
+            _save_history(
+                session_id,
+                history + [
+                    Message(role="user", content=request.message),
+                    Message(role="assistant", content=canned),
+                ],
+            )
+            try:
+                db.add(FeedbackInteraction(
+                    user_id=user_id,
+                    session_id=session_id,
+                    message_id=message_id,
+                    timestamp=datetime.utcnow(),
+                    question=request.message,
+                    response=canned,
+                    provider_used="guardrail",
+                    tokens_used=None,
+                ))
+                db.commit()
+            except Exception as exc:
+                logger.error("Failed to save guardrail interaction: %s", exc, exc_info=True)
+                db.rollback()
+
+            _attach_background_agent_callback(
+                agent_future,
+                scope=scope,
+                user_id=user_id,
+                session_id=session_id,
+                message_id=message_id,
+            )
+
+            total_ms = (time.perf_counter() - start_time) * 1000.0
+            _write_metric(
+                db,
+                message_id=message_id,
+                session_id=session_id,
+                path="guardrail_block",
+                total_ms=total_ms,
+                guardrail_ms=input_decision.latency_ms,
+                agent_ms=None,
+                llm_calls=1,
+                agent_rounds=0,
+                tokens=None,
+                cached_tokens=None,
+                provider="guardrail",
+                model_used=input_decision.model or gr_cfg.model,
+                parallel=True,
+            )
+
+            return ChatResponse(
+                response=canned,
+                sources=[],
+                session_id=session_id,
+                message_id=message_id,
+                success=True,
+                provider_used="guardrail",
+                tokens_used=None,
+                tools_used=[],
+                react_steps=[],
+                suggestions=[],
+                scoped=scope is not None,
+                guardrail="medical_advice",
+            )
+
+        if input_decision.category in ("greeting", "out_of_scope"):
+            reply_text = getattr(
+                fast_path_cfg.replies, input_decision.category, fast_path_cfg.replies.greeting
+            )
+            _save_history(
+                session_id,
+                history + [
+                    Message(role="user", content=request.message),
+                    Message(role="assistant", content=reply_text),
+                ],
+            )
+            try:
+                db.add(FeedbackInteraction(
+                    user_id=user_id,
+                    session_id=session_id,
+                    message_id=message_id,
+                    timestamp=datetime.utcnow(),
+                    question=request.message,
+                    response=reply_text,
+                    provider_used="guardrail_route",
+                    tokens_used=None,
+                ))
+                db.commit()
+            except Exception as exc:
+                logger.error("Failed to save guardrail route interaction: %s", exc, exc_info=True)
+                db.rollback()
+
+            _attach_background_agent_callback(
+                agent_future,
+                scope=scope,
+                user_id=user_id,
+                session_id=session_id,
+                message_id=message_id,
+            )
+
+            total_ms = (time.perf_counter() - start_time) * 1000.0
+            _write_metric(
+                db,
+                message_id=message_id,
+                session_id=session_id,
+                path="guardrail_route",
+                total_ms=total_ms,
+                guardrail_ms=input_decision.latency_ms,
+                agent_ms=None,
+                llm_calls=1,
+                agent_rounds=0,
+                tokens=None,
+                cached_tokens=None,
+                provider="guardrail_route",
+                model_used=input_decision.model or gr_cfg.model,
+                parallel=True,
+            )
+
+            return ChatResponse(
+                response=reply_text,
+                sources=[],
+                session_id=session_id,
+                message_id=message_id,
+                success=True,
+                provider_used="guardrail_route",
+                tokens_used=None,
+                tools_used=[],
+                react_steps=[],
+                suggestions=[],
+                scoped=scope is not None,
+                guardrail=None,
+            )
+
+        # Allowed: wait for agent
+        try:
+            result = agent_future.result()
+        except ScopeViolation as e:
+            logger.critical("SCOPE VIOLATION on session %s: %s", session_id, e)
+            total_ms = (time.perf_counter() - start_time) * 1000.0
+            _write_metric(
+                db,
+                message_id=message_id,
+                session_id=session_id,
+                path="agent_error",
+                total_ms=total_ms,
+                guardrail_ms=input_decision.latency_ms if input_decision else None,
+                agent_ms=None,
+                llm_calls=1,
+                agent_rounds=0,
+                tokens=None,
+                cached_tokens=None,
+                provider="none",
+                model_used=None,
+                parallel=True,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="A data access check failed. This request was blocked.",
+            )
+
+    else:
+        # Sequential path: check input first
+        if gr_cfg.enabled:
+            input_decision = get_medical_guardrail().check_input(request.message, history)
+            _log_guardrail_event(
+                db,
+                session_id=session_id,
+                user_id=user_id,
+                message_id=message_id,
+                decision=input_decision,
+                model=input_decision.model or gr_cfg.model,
+            )
+            if input_decision.blocked:
+                canned = gr_cfg.canned_response
+                _save_history(
+                    session_id,
+                    history + [
+                        Message(role="user", content=request.message),
+                        Message(role="assistant", content=canned),
+                    ],
+                )
+                try:
+                    db.add(FeedbackInteraction(
+                        user_id=user_id,
+                        session_id=session_id,
+                        message_id=message_id,
+                        timestamp=datetime.utcnow(),
+                        question=request.message,
+                        response=canned,
+                        provider_used="guardrail",
+                        tokens_used=None,
+                    ))
+                    db.commit()
+                except Exception as exc:
+                    logger.error("Failed to save guardrail interaction: %s", exc, exc_info=True)
+                    db.rollback()
+
+                total_ms = (time.perf_counter() - start_time) * 1000.0
+                _write_metric(
+                    db,
+                    message_id=message_id,
+                    session_id=session_id,
+                    path="guardrail_block",
+                    total_ms=total_ms,
+                    guardrail_ms=input_decision.latency_ms,
+                    agent_ms=None,
+                    llm_calls=1,
+                    agent_rounds=0,
+                    tokens=None,
+                    cached_tokens=None,
+                    provider="guardrail",
+                    model_used=input_decision.model or gr_cfg.model,
+                    parallel=False,
+                )
+
+                return ChatResponse(
+                    response=canned,
+                    sources=[],
+                    session_id=session_id,
+                    message_id=message_id,
+                    success=True,
+                    provider_used="guardrail",
+                    tokens_used=None,
+                    tools_used=[],
+                    react_steps=[],
+                    suggestions=[],
+                    scoped=scope is not None,
+                    guardrail="medical_advice",
+                )
+
+            # Step 4: Let gatekeeper route greetings and out_of_scope
+            if input_decision.category in ("greeting", "out_of_scope"):
+                reply_text = getattr(
+                    fast_path_cfg.replies, input_decision.category, fast_path_cfg.replies.greeting
+                )
+                _save_history(
+                    session_id,
+                    history + [
+                        Message(role="user", content=request.message),
+                        Message(role="assistant", content=reply_text),
+                    ],
+                )
+                try:
+                    db.add(FeedbackInteraction(
+                        user_id=user_id,
+                        session_id=session_id,
+                        message_id=message_id,
+                        timestamp=datetime.utcnow(),
+                        question=request.message,
+                        response=reply_text,
+                        provider_used="guardrail_route",
+                        tokens_used=None,
+                    ))
+                    db.commit()
+                except Exception as exc:
+                    logger.error("Failed to save guardrail route interaction: %s", exc, exc_info=True)
+                    db.rollback()
+
+                total_ms = (time.perf_counter() - start_time) * 1000.0
+                _write_metric(
+                    db,
+                    message_id=message_id,
+                    session_id=session_id,
+                    path="guardrail_route",
+                    total_ms=total_ms,
+                    guardrail_ms=input_decision.latency_ms,
+                    agent_ms=None,
+                    llm_calls=1,
+                    agent_rounds=0,
+                    tokens=None,
+                    cached_tokens=None,
+                    provider="guardrail_route",
+                    model_used=input_decision.model or gr_cfg.model,
+                    parallel=False,
+                )
+
+                return ChatResponse(
+                    response=reply_text,
+                    sources=[],
+                    session_id=session_id,
+                    message_id=message_id,
+                    success=True,
+                    provider_used="guardrail_route",
+                    tokens_used=None,
+                    tools_used=[],
+                    react_steps=[],
+                    suggestions=[],
+                    scoped=scope is not None,
+                    guardrail=None,
+                )
+
+        try:
+            result = orchestrator.run(
+                user_message=request.message,
+                scope=scope,
+                history=history,
+                preferred_provider=request.provider,
+                session_id=session_id,
+                user_id=user_id,
+            )
+        except ScopeViolation as e:
+            logger.critical("SCOPE VIOLATION on session %s: %s", session_id, e)
+            total_ms = (time.perf_counter() - start_time) * 1000.0
+            _write_metric(
+                db,
+                message_id=message_id,
+                session_id=session_id,
+                path="agent_error",
+                total_ms=total_ms,
+                guardrail_ms=input_decision.latency_ms if input_decision else None,
+                agent_ms=None,
+                llm_calls=(1 if input_decision else 0),
+                agent_rounds=0,
+                tokens=None,
+                cached_tokens=None,
+                provider="none",
+                model_used=None,
+                parallel=False,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="A data access check failed. This request was blocked.",
+            )
+
+    # ── Citations verification (before memory save & output check) ───────────
+    if not result.error and get_citations_config().verify:
+        check = verify_citations(result.content, result.sources, message_id=message_id)
+        if check.invalid > 0:
+            logger.warning(
+                "Citations verified | msg=%s valid=%d invalid=%d missing_page=%d",
+                message_id, check.valid, check.invalid, check.missing_page,
+            )
+        else:
+            logger.info(
+                "Citations verified | msg=%s valid=%d invalid=%d missing_page=%d",
+                message_id, check.valid, check.invalid, check.missing_page,
+            )
+        result.content = check.text
+        if result.messages:
+            for m in reversed(result.messages):
+                if m.role == "assistant":
+                    m.content = check.text
+                    break
+
     if result.error:
-        # A failed turn is not committed to memory. result.messages would end
-        # on the unanswered user message, so the next request would append a
-        # second user turn back to back - a shape every provider rejects, which
-        # would turn one upstream failure into a permanently broken session.
         logger.error("Orchestration error (turn not saved): %s", result.error)
     else:
         _save_history(session_id, result.messages)
+
+    # ── Medical guardrail output check (optional) ────────────────────────────
+    guardrail_field: Optional[str] = None
+    response_content = result.content
+    response_sources = result.sources
+    response_suggestions_flag = True
+    out_decision = None
+    if not result.error and gr_cfg.enabled and gr_cfg.output_check:
+        out_decision = get_medical_guardrail().check_output(result.content)
+        _log_guardrail_event(
+            db,
+            session_id=session_id,
+            user_id=user_id,
+            message_id=message_id,
+            decision=out_decision,
+            model=out_decision.model or gr_cfg.model,
+        )
+        if out_decision.blocked:
+            canned = gr_cfg.canned_response
+            _save_history(
+                session_id,
+                history + [
+                    Message(role="user", content=request.message),
+                    Message(role="assistant", content=canned),
+                ],
+            )
+            response_content = canned
+            response_sources = []
+            response_suggestions_flag = False
+            guardrail_field = "medical_advice"
 
     _write_audit(db, result=result, scope=scope, user_id=user_id,
                  session_id=session_id, message_id=message_id)
@@ -243,7 +817,7 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
             message_id=message_id,
             timestamp=datetime.utcnow(),
             question=request.message,
-            response=result.content,
+            response=response_content,
             provider_used=result.provider_used,
             tokens_used=result.tokens_used,
         ))
@@ -251,6 +825,44 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error("Failed to save interaction: %s", e, exc_info=True)
         db.rollback()
+
+    # Determine metric path:
+    if result.error:
+        metric_path = "agent_error"
+    elif getattr(result, "capped", False):
+        metric_path = "agent_capped"
+    else:
+        metric_path = "agent"
+
+    total_ms = (time.perf_counter() - start_time) * 1000.0
+    guardrail_ms = None
+    if input_decision:
+        guardrail_ms = input_decision.latency_ms
+    if out_decision:
+        guardrail_ms = (guardrail_ms or 0.0) + out_decision.latency_ms
+
+    llm_calls = (
+        (1 if input_decision else 0)
+        + (1 if out_decision else 0)
+        + getattr(result, "llm_calls", 0)
+    )
+
+    _write_metric(
+        db,
+        message_id=message_id,
+        session_id=session_id,
+        path=metric_path,
+        total_ms=total_ms,
+        guardrail_ms=guardrail_ms,
+        agent_ms=getattr(result, "total_execution_time_ms", None),
+        llm_calls=llm_calls,
+        agent_rounds=len(getattr(result, "react_steps", []) or []),
+        tokens=result.tokens_used,
+        cached_tokens=getattr(result, "cached_tokens", None),
+        provider=result.provider_used,
+        model_used=getattr(result, "model_used", None),
+        parallel=is_parallel,
+    )
 
     raw_steps = getattr(result, "react_steps", []) or []
     step_models = [
@@ -267,8 +879,8 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
     ]
 
     return ChatResponse(
-        response=result.content,
-        sources=[Source(**s) for s in result.sources],
+        response=response_content,
+        sources=[Source(**s) for s in response_sources],
         session_id=session_id,
         message_id=message_id,
         success=not result.error,
@@ -279,20 +891,24 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
             for t in result.tool_calls
         ],
         react_steps=step_models,
-        suggestions=suggestions.build(result.tool_calls),
+        suggestions=suggestions.build(result.tool_calls) if response_suggestions_flag else [],
         scoped=scope is not None,
+        guardrail=guardrail_field,
     )
 
 
-@router.get("/memory/info/{session_id}")
+@router.get("/memory/info/{session_id}", dependencies=[Depends(require_admin)])
 def get_memory_info(session_id: str):
     """Inspect what a session currently remembers, tool turns included."""
     memory_config = get_conversation_memory_config()
-    history = session_memories.get(session_id, [])
+    store = get_memory_store()
+    history = store.load(session_id)
+    exists = store.exists(session_id)
 
     return {
         "session_id": session_id,
-        "session_exists": session_id in session_memories,
+        "session_exists": exists,
+        "backend": store.status()["backend"],
         "config": {
             "type": memory_config.type,
             "buffer_window_k": memory_config.buffer_window.k,
@@ -311,7 +927,7 @@ def get_memory_info(session_id: str):
     }
 
 
-@router.get("/history/{session_id}")
+@router.get("/history/{session_id}", dependencies=[Depends(require_admin)])
 def get_chat_history(session_id: str, db: Session = Depends(get_db)):
     """Stored exchanges for a session."""
     try:
@@ -341,11 +957,11 @@ def get_chat_history(session_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Could not load history")
 
 
-@router.delete("/history/{session_id}")
+@router.delete("/history/{session_id}", dependencies=[Depends(require_admin)])
 def delete_chat_history(session_id: str, db: Session = Depends(get_db)):
     """Delete a session's stored exchanges and its in-memory context."""
     try:
-        session_memories.pop(session_id, None)
+        get_memory_store().clear(session_id)
         deleted = (
             db.query(FeedbackInteraction)
             .filter(FeedbackInteraction.session_id == session_id)
@@ -360,10 +976,10 @@ def delete_chat_history(session_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Could not delete history")
 
 
-@router.post("/clear/{session_id}")
+@router.post("/clear/{session_id}", dependencies=[Depends(require_admin)])
 def clear_session_memory(session_id: str):
     """Forget a session's conversation without touching stored history."""
-    existed = session_memories.pop(session_id, None) is not None
+    existed = get_memory_store().clear(session_id)
     return {
         "success": True,
         "message": (f"Cleared memory for session {session_id}" if existed

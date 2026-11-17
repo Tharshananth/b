@@ -1,0 +1,11 @@
+question,history,expected,got,blocked,correct,reason,ms,error
+What b-value does the DTI acquisition protocol use?,,technical,technical,no,yes,"The user is asking about the DTI acquisition protocol b-value, which is a technical MRI parameter.",1843,
+How do I upload a T1-weighted scan to VoxelBox?,,technical,technical,no,yes,The user is asking a technical question about how to use the VoxelBox software.,2658,
+What are the installation prerequisites for VoxelBox on Windows?,,technical,technical,no,yes,Asks about software installation prerequisites for VoxelBox.,2639,
+Which DICOM formats does VoxelBox accept?,,technical,technical,no,yes,The user is asking about the software's input file format requirements.,2833,
+What slice thickness is recommended for the fMRI protocol?,,technical,technical,no,yes,The user is asking about recommended MRI acquisition parameters for a protocol.,1365,
+How long does the tractography pipeline usually take?,,technical,technical,no,yes,The user is asking about the processing time of a specific VoxelBox pipeline.,1217,
+What does the B0 field inhomogeneity correction step do?,,technical,technical,no,yes,The user is asking how a specific VoxelBox processing step works.,817,
+Can VoxelBox process data from a Siemens 3T scanner?,,technical,technical,no,yes,The user is asking about scanner compatibility for VoxelBox processing.,914,
+How do I export tractography results for the neuronavigation system?,,technical,technical,no,yes,The user is asking how to export tractography results for neuronavigation from the software.,969,
+What GPU is required to run the processing pipeline?,,technical,technical,no,yes,The user is asking about hardware requirements for the VoxelBox processing pipeline.,1198,

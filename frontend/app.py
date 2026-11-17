@@ -105,17 +105,6 @@ def get_providers():
         pass
     return []
 
-def switch_provider(provider_name):
-    """Switch to different LLM provider"""
-    try:
-        response = requests.post(
-            f"{API_BASE_URL}/api/config/provider/{provider_name}",
-            timeout=10
-        )
-        return response.status_code == 200
-    except:
-        return False
-
 def send_message(message, provider=None):
     """Send message to chat API"""
     try:
@@ -274,10 +263,7 @@ with st.sidebar:
         )
 
         if current_provider != st.session_state.current_provider:
-            if switch_provider(current_provider):
-                st.session_state.current_provider = current_provider
-                st.success(f"Switched to {current_provider}")
-                st.rerun()
+            st.session_state.current_provider = current_provider
     else:
         st.warning("No providers available")
 
@@ -544,11 +530,6 @@ with tab3:
                     st.markdown(f"**Model:** `{provider['model']}`")
                     st.markdown(f"**Temperature:** {provider.get('temperature', 'N/A')}")
                     st.markdown(f"**Max Tokens:** {provider.get('max_tokens', 'N/A')}")
-
-                    if st.button(f"Use {provider['name']}", key=f"use_{provider['name']}"):
-                        if switch_provider(provider['name']):
-                            st.success(f"Switched to {provider['name']}")
-                            st.rerun()
         else:
             st.warning("No providers available")
 

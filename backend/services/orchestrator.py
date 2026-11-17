@@ -24,7 +24,7 @@ def run(
     scope: Optional[TenantScope] = None,
     history: Optional[List[Message]] = None,
     preferred_provider: Optional[str] = None,
-    max_iterations: int = MAX_ITERATIONS,
+    max_iterations: Optional[int] = None,
     session_id: Optional[str] = None,
     user_id: Optional[str] = None,
 ) -> OrchestratorResult:

@@ -168,8 +168,8 @@ const Chatbot = () => {
   const [feedbackText, setFeedbackText] = useState('');
   const messagesEndRef = useRef(null);
 
-  // API URL
-  const API_BASE_URL = process.env.REACT_APP_API_URL || `http://${window.location.hostname}:8000`;
+  // API URL - default to port 8042 on current host (supports both localhost and 4.213.16.34)
+  const API_BASE_URL = process.env.REACT_APP_API_URL || `${window.location.protocol}//${window.location.hostname}:8042`;
 
   // Claude-like activity progression timer
   useEffect(() => {

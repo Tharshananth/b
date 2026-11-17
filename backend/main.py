@@ -3,6 +3,7 @@ Main Application - Simplified
 No Redis, No 5-minute context window
 Uses LangChain ConversationBufferWindowMemory
 """
+import os
 import sys
 import io
 from pathlib import Path
@@ -17,9 +18,12 @@ import logging
 from contextlib import asynccontextmanager
 
 # Fix Windows console encoding
-if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+if sys.platform == 'win32' and 'pytest' not in sys.modules:
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    except (AttributeError, io.UnsupportedOperation):
+        pass
 
 
 # Add parent directory to path
@@ -28,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import get_config, get_api_config
 from utils.logger import setup_logger
 from routers import documents_router, health_router, config_router, feedback_router
+from routers.auth import router as auth_router
 from routers.chat import router as chat_router  # Import simplified chat router
 from vector_db.retriever import get_retriever
 from utils.document_loader import DocumentLoader
@@ -58,6 +63,12 @@ async def lifespan(app: FastAPI):
         logger.info("Database initialized")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
+    
+    # Verify prompts and log version (fails startup if prompt missing)
+    from agents.prompt import get_react_system_prompt
+    from prompts.loader import prompt_version
+    get_react_system_prompt()
+    logger.info("Prompt version: %s", prompt_version())
     
     try:
         # Initialize vector store
@@ -97,13 +108,19 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down application...")
 
+# Determine API docs availability
+_environment = config.app.environment
+_enable_api_docs = os.getenv("ENABLE_API_DOCS", "").strip().lower()
+_docs_enabled = _environment != "production" or _enable_api_docs == "true"
+
 # Create FastAPI app
 app = FastAPI(
     title="VoxelBox RAG Chatbot",
     description="AI-powered chatbot with RAG capabilities",
     version="2.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
     lifespan=lifespan
 )
 
@@ -169,6 +186,7 @@ app.include_router(documents_router)
 app.include_router(health_router)
 app.include_router(config_router)
 app.include_router(feedback_router)
+app.include_router(auth_router)
 
 # Root endpoint
 @app.get("/", include_in_schema=False)

@@ -1,7 +1,7 @@
 from google import genai
 
 # paste your api key here
-API_KEY = ""
+API_KEY = "AIzaSyCPJArOLM3t3yQxY9OnE59VO2_wGrIwkLE"
 
 import time
 

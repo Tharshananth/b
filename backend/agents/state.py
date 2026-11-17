@@ -65,6 +65,10 @@ class ReActResult:
     react_steps: List[ReActStep] = field(default_factory=list)
     total_execution_time_ms: float = 0.0
     error: Optional[str] = None
+    model_used: Optional[str] = None
+    capped: bool = False
+    llm_calls: int = 0
+    cached_tokens: int = 0
 
 
 class ReActStepResponse(BaseModel):

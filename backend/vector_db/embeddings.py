@@ -3,8 +3,15 @@
 """Embedding provider management"""
 import logging
 from typing import Optional
-from langchain_openai import OpenAIEmbeddings
-from langchain_huggingface import HuggingFaceEmbeddings
+try:
+    from langchain_openai import OpenAIEmbeddings
+except ImportError:
+    OpenAIEmbeddings = None
+
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+except ImportError:
+    HuggingFaceEmbeddings = None
 from config import get_config, get_embedding_api_key
 
 logger = logging.getLogger(__name__)
@@ -36,7 +43,8 @@ def get_embeddings():
             
         elif provider == "huggingface":
             _embeddings = HuggingFaceEmbeddings(
-                model_name=provider_config.model
+                model_name=provider_config.model,
+                encode_kwargs={"normalize_embeddings": True}
             )
             logger.info(f" Using HuggingFace embeddings: {provider_config.model}")
         
@@ -47,10 +55,16 @@ def get_embeddings():
         
     except Exception as e:
         logger.error(f"Failed to initialize embeddings: {e}")
-        # Fallback to HuggingFace
-        logger.info("Falling back to HuggingFace embeddings")
-        _embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
-        return _embeddings
+        # Fallback to HuggingFace only if the library is available
+        if HuggingFaceEmbeddings is not None:
+            logger.info("Falling back to HuggingFace embeddings")
+            _embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+                encode_kwargs={"normalize_embeddings": True}
+            )
+            return _embeddings
+        raise RuntimeError(
+            "No embedding backend is available. Install langchain-openai or "
+            "langchain-huggingface, or configure a valid embedding provider."
+        ) from e
 

@@ -59,12 +59,15 @@ class ClaudeProvider(BaseLLMProvider):
         messages: List[Message],
         system_prompt: Optional[str] = None,
         tools: Optional[List[ToolSpec]] = None,
+        tool_choice: Optional[str] = None,
         **kwargs
     ) -> LLMResponse:
         try:
             formatted_messages = self._format_for_tools(messages)
             if tools:
                 kwargs["tools"] = to_anthropic(tools)
+            if tool_choice == "none":
+                kwargs["tool_choice"] = {"type": "none"}
 
             kwargs.setdefault("timeout", float(self.timeout))
             response = self.client.messages.create(
@@ -85,13 +88,19 @@ class ClaudeProvider(BaseLLMProvider):
                 if getattr(b, "type", None) == "tool_use"
             ]
 
+            cached_tokens = (
+                getattr(response.usage, "cache_read_input_tokens", None)
+                if getattr(response, "usage", None) else None
+            )
+
             return LLMResponse(
                 content=text,
                 model=self.model,
                 provider="claude",
-                tokens_used=response.usage.input_tokens + response.usage.output_tokens,
+                tokens_used=response.usage.input_tokens + response.usage.output_tokens if getattr(response, "usage", None) else None,
                 finish_reason=response.stop_reason,
                 tool_calls=calls or None,
+                cached_tokens=cached_tokens,
             )
         except Exception as e:
             return self._handle_error(e, "generate_response")

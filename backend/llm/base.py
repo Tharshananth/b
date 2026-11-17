@@ -61,6 +61,7 @@ class LLMResponse:
     finish_reason: Optional[str] = None
     error: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
+    cached_tokens: Optional[int] = None
 
     @property
     def wants_tools(self) -> bool:
@@ -109,6 +110,7 @@ class BaseLLMProvider(ABC):
         messages: List[Message],
         system_prompt: Optional[str] = None,
         tools: Optional[List["ToolSpec"]] = None,
+        tool_choice: Optional[str] = None,
         **kwargs
     ) -> LLMResponse:
         """

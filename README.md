@@ -383,3 +383,146 @@ npm run build
 - [x] Check database read/write permissions for `backend/data/database/feedback.db`.
 - [x] Confirm LLM fallback hierarchy in `backend/config.yaml` (`gemini` → `openai` → `claude` → `huggingface`).
 - [x] Verify that Thought Disclosure drawers on the UI expand and collapse smoothly without rendering raw syntax tags.
+
+---
+
+## Admin Authentication
+
+The BSAI backend includes role-gated admin authentication using JSON Web Tokens (JWT) signed with HS256 and bcrypt password hashing.
+
+### 1. Generating JWT_SECRET
+A cryptographically secure secret of at least 32 characters is required for signing JWT access tokens. Generate a unique secret for each deployment environment:
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+Place this in `backend/.env` (e.g., `JWT_SECRET=<generated_secret>`).
+> **Important:**
+> - Generate once per environment; use distinct secrets for development, staging, and production.
+> - Never hardcode or commit `JWT_SECRET` to version control.
+> - If `JWT_SECRET` is missing or shorter than 32 characters, protected admin routes return HTTP 503 (`Admin authentication is not configured`).
+
+Additional optional environment variables:
+- `ADMIN_TOKEN_TTL_MINUTES`: Token lifetime in minutes (default: `60`).
+- `ENABLE_API_DOCS`: Set to `true` to enable Swagger (`/docs`) and ReDoc (`/redoc`) in production (default: `false`).
+
+### 2. Admin User Management CLI (`create_admin.py`)
+All admin user management is performed via the CLI from the `backend/` directory. There is no public user registration HTTP endpoint. Passwords are entered securely via non-echoing terminal prompts (`getpass`) and must be at least 12 characters in production (8 in non-production) and up to 72 bytes.
+
+```bash
+cd backend
+
+# Create a new admin user
+python scripts/create_admin.py create --username tharshan@bsai.com --email tharshan@bsai.com --role admin
+
+# Reset an admin user's password
+python scripts/create_admin.py password --username tharshan@bsai.com
+
+# Disable an admin user (takes effect immediately on active tokens)
+python scripts/create_admin.py disable --username tharshan@bsai.com
+
+# Re-enable an admin user
+python scripts/create_admin.py enable --username tharshan@bsai.com
+
+# List all admin users (displays username, role, active status, last login; never password hashes)
+python scripts/create_admin.py list
+```
+
+### 3. Obtaining and Using an Access Token
+To authenticate as an admin, send a POST request with the credentials:
+```bash
+curl -X POST "http://localhost:8042/api/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "your_secure_password"}'
+```
+Response:
+```json
+{
+  "access_token": "<jwt_token>",
+  "token_type": "bearer",
+  "expires_in": 3600
+}
+```
+
+Use the access token in the `Authorization` header for all protected requests:
+```bash
+curl -X GET "http://localhost:8042/api/documents/" \
+  -H "Authorization: Bearer <jwt_token>"
+```
+
+Check current user profile:
+```bash
+curl -X GET "http://localhost:8042/api/auth/me" \
+  -H "Authorization: Bearer <jwt_token>"
+```
+
+### 4. Protected Routes
+The following endpoints require admin authentication (`Authorization: Bearer <token>`):
+- **Document Management**:
+  - `GET /api/documents/`: List indexed knowledge-base documents
+  - `POST /api/documents/upload`: Upload and index a document (audit-logged)
+  - `DELETE /api/documents/{filename}`: Delete a document (audit-logged)
+  - `POST /api/documents/refresh`: Re-index knowledge-base documents (audit-logged)
+- **Configuration & Auth**:
+  - `GET /api/config/`: View runtime system and model configuration
+  - `GET /api/config/providers`: List available LLM providers
+  - `GET /api/auth/me`: Get current admin user details
+
+### 5. Removed Insecure Endpoints
+For security hardening, the following endpoints were permanently removed from the API:
+- `POST /api/config/provider/{provider_name}`: Previously permitted unauthenticated callers to switch the global LLM provider for a single server process.
+- `GET /api/config/system-prompt`: Previously exposed internal clinical system prompts to unauthenticated callers.
+
+---
+
+## Conversation Memory
+
+The BSAI chatbot features a pluggable conversation memory store that moves session state out of local server RAM into Redis.
+
+### 1. Why Memory is in Redis
+In production with multiple uvicorn workers (e.g. `uvicorn --workers 4`) or multi-instance deployments, requests for the same session frequently land on different worker processes. Moving conversation memory to Redis ensures:
+- **Zero Loss on Restarts**: Application restarts or deployments do not wipe active clinician conversations.
+- **Cross-Worker Sharing**: All uvicorn worker processes share identical conversation history for each session.
+- **Preserved ReAct Tool Context**: Complex 4-message tool exchanges (question, model tool call, tool observation, final answer) along with opaque provider data (such as Gemini `thought_signature` bytes) survive across turns without serialization loss.
+
+### 2. Backend Options
+Configured in `backend/config.yaml` under `conversation_memory.backend`:
+- `redis`: Production store backed by Redis. Reads the connection URL from the `REDIS_URL` environment variable.
+- `in_process`: Thread-safe, in-memory dictionary store for local development or lightweight testing without Redis.
+
+If `backend: redis` is configured but `REDIS_URL` is unset or empty, the backend logs an error and automatically falls back to `in_process` so the service remains operational.
+
+### 3. Sliding Expiry (TTL)
+Conversation sessions use a sliding inactivity timeout (`ttl_minutes: 60` by default):
+- Every successful chat turn resets the key TTL to the configured lifetime (`SET key value EX ttl_seconds`).
+- Active conversations stay in memory indefinitely as long as turns continue.
+- Inactive sessions expire automatically after the TTL window without manual pruning.
+
+### 4. Fail-Open & Circuit-Breaker Architecture
+Chat reliability is strictly decoupled from Redis availability:
+- **Fail-Open**: If Redis is unreachable, overloaded, or throws an error, memory operations never raise exceptions into the chat endpoint. Chat continues uninterrupted as single-turn interactions.
+- **Circuit Breaker**: When a Redis error occurs, a process-local circuit breaker opens for `circuit_breaker_s` seconds (default: 30s). During cooldown, all memory calls skip Redis entirely and return fail-open defaults immediately (< 1ms).
+- **Automatic Recovery**: Once the cooldown expires, the next call probes Redis. If successful, the breaker automatically closes and normal memory resumes.
+- **Health Reporting**: The `/api/health` endpoint reports the memory status (`connected: true/false`, `circuit_open: true/false`). When Redis is down, the service still returns HTTP 200 with `status: "healthy"` and `memory.connected: false`.
+
+### 5. Running Redis Locally
+To run Redis for local development:
+- **Docker**:
+  ```bash
+  docker run -d --name bsai-redis -p 6379:6379 redis:7
+  ```
+- **Windows (WSL / Native)**:
+  - Inside WSL: `sudo apt install redis-server && sudo service redis-server start`
+  - Or use a native Windows Redis port (e.g., Memurai or Redis 5 for Windows).
+
+Configure `REDIS_URL` in `backend/.env`:
+```ini
+REDIS_URL=redis://localhost:6379/0
+```
+
+### 6. Verifying Redis Memory Pretest
+To verify that your Redis server, serialization codec, trimming, TTL, and multi-process support are functioning properly:
+```bash
+cd backend
+python scripts/pretest_redis_memory.py
+```
+

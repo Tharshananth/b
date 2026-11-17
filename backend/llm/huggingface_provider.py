@@ -29,6 +29,7 @@ class HuggingFaceProvider(BaseLLMProvider):
         messages: List[Message],
         system_prompt: Optional[str] = None,
         tools: Optional[List[ToolSpec]] = None,
+        tool_choice: Optional[str] = None,
         **kwargs
     ) -> LLMResponse:
         if tools:

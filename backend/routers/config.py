@@ -1,15 +1,21 @@
-
-
 # routers/config.py
 """Configuration management endpoints"""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from typing import Dict, List
 import logging
 from llm.factory import get_llm_factory
 from config import get_config
+from auth.dependencies import require_admin
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/config", tags=["Configuration"])
+
+# Removed on purpose (V2 item 2): POST /provider/{name} (model is set in config.yaml on the server, never over HTTP) and GET /system-prompt (exposed the system prompt).
+router = APIRouter(
+    prefix="/api/config",
+    tags=["Configuration"],
+    dependencies=[Depends(require_admin)],
+)
+
 
 @router.get("/")
 async def get_configuration() -> Dict:
@@ -38,8 +44,9 @@ async def get_configuration() -> Dict:
             }
         }
     except Exception as e:
-        logger.error(f"Config error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Config error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve configuration")
+
 
 @router.get("/providers")
 async def list_providers() -> List[Dict]:
@@ -53,62 +60,5 @@ async def list_providers() -> List[Dict]:
         factory = get_llm_factory()
         return factory.get_provider_info()
     except Exception as e:
-        logger.error(f"Provider list error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/provider/{provider_name}")
-async def switch_provider(provider_name: str) -> Dict:
-    """
-    Switch to a different LLM provider
-    
-    Args:
-        provider_name: Name of provider to switch to
-        
-    Returns:
-        Switch status
-    """
-    try:
-        factory = get_llm_factory()
-        available = factory.get_available_providers()
-        
-        if provider_name not in available:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Provider {provider_name} not available. Available: {available}"
-            )
-        
-        # Update default provider in config (runtime only)
-        config = get_config()
-        config.llm.default_provider = provider_name
-        
-        logger.info(f"Switched to provider: {provider_name}")
-        
-        return {
-            "success": True,
-            "provider": provider_name,
-            "message": f"Switched to {provider_name} provider"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Provider switch error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/system-prompt")
-async def get_system_prompt() -> Dict:
-    """
-    Get the current system prompt
-    
-    Returns:
-        System prompt text
-    """
-    try:
-        config = get_config()
-        return {
-            "system_prompt": config.system_prompt
-        }
-    except Exception as e:
-        logger.error(f"System prompt error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-        
+        logger.error(f"Provider list error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve provider list")

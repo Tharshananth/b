@@ -56,12 +56,15 @@ class OpenAIProvider(BaseLLMProvider):
         messages: List[Message],
         system_prompt: Optional[str] = None,
         tools: Optional[List[ToolSpec]] = None,
+        tool_choice: Optional[str] = None,
         **kwargs
     ) -> LLMResponse:
         try:
             formatted_messages = self._format_for_tools(messages, system_prompt)
             if tools:
                 kwargs["tools"] = to_openai(tools)
+            if tool_choice == "none":
+                kwargs["tool_choice"] = "none"
 
             kwargs.setdefault("timeout", self.timeout)
             response = self.client.chat.completions.create(
@@ -84,6 +87,12 @@ class OpenAIProvider(BaseLLMProvider):
                     calls.append(ToolCall(id=tc.id, name=tc.function.name,
                                           arguments=args))
 
+            cached_tokens = None
+            if getattr(response, "usage", None):
+                details = getattr(response.usage, "prompt_tokens_details", None)
+                if details:
+                    cached_tokens = getattr(details, "cached_tokens", None)
+
             return LLMResponse(
                 content=choice.message.content or "",
                 model=self.model,
@@ -91,6 +100,7 @@ class OpenAIProvider(BaseLLMProvider):
                 tokens_used=response.usage.total_tokens if response.usage else None,
                 finish_reason=choice.finish_reason,
                 tool_calls=calls,
+                cached_tokens=cached_tokens,
             )
         except Exception as e:
             return self._handle_error(e, "generate_response")

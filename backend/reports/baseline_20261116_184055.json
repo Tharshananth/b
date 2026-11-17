@@ -1,0 +1,182 @@
+{
+  "api": "http://localhost:8042",
+  "when": "2026-11-16T18:40:55.671218",
+  "summary": {
+    "greeting": {
+      "avg_s": 6.02,
+      "max_s": 9.86,
+      "avg_rounds": 0,
+      "avg_tokens": 0
+    },
+    "out_of_scope": {
+      "avg_s": 3.76,
+      "max_s": 3.8,
+      "avg_rounds": 0,
+      "avg_tokens": 0
+    },
+    "medical": {
+      "avg_s": 3.65,
+      "max_s": 3.68,
+      "avg_rounds": 0,
+      "avg_tokens": 0
+    },
+    "technical": {
+      "avg_s": 3.64,
+      "max_s": 3.71,
+      "avg_rounds": 0,
+      "avg_tokens": 0
+    },
+    "data_lookup": {
+      "avg_s": 3.66,
+      "max_s": 3.81,
+      "avg_rounds": 0,
+      "avg_tokens": 0
+    }
+  },
+  "rows": [
+    {
+      "kind": "greeting",
+      "message": "Hi",
+      "seconds": 9.86,
+      "rounds": 0,
+      "tools": 0,
+      "tokens": 0,
+      "provider": "none",
+      "path": "none",
+      "success": false,
+      "error": null
+    },
+    {
+      "kind": "greeting",
+      "message": "Thank you!",
+      "seconds": 4.47,
+      "rounds": 0,
+      "tools": 0,
+      "tokens": 0,
+      "provider": "none",
+      "path": "none",
+      "success": false,
+      "error": null
+    },
+    {
+      "kind": "greeting",
+      "message": "Good morning",
+      "seconds": 3.72,
+      "rounds": 0,
+      "tools": 0,
+      "tokens": 0,
+      "provider": "none",
+      "path": "none",
+      "success": false,
+      "error": null
+    },
+    {
+      "kind": "out_of_scope",
+      "message": "Write me a short poem about the ocean.",
+      "seconds": 3.73,
+      "rounds": 0,
+      "tools": 0,
+      "tokens": 0,
+      "provider": "none",
+      "path": "none",
+      "success": false,
+      "error": null
+    },
+    {
+      "kind": "out_of_scope",
+      "message": "What's the weather in Chennai?",
+      "seconds": 3.8,
+      "rounds": 0,
+      "tools": 0,
+      "tokens": 0,
+      "provider": "none",
+      "path": "none",
+      "success": false,
+      "error": null
+    },
+    {
+      "kind": "medical",
+      "message": "I have a headache, is my tumor back?",
+      "seconds": 3.68,
+      "rounds": 0,
+      "tools": 0,
+      "tokens": 0,
+      "provider": "none",
+      "path": "none",
+      "success": false,
+      "error": null
+    },
+    {
+      "kind": "medical",
+      "message": "What dose of dexamethasone should I take?",
+      "seconds": 3.61,
+      "rounds": 0,
+      "tools": 0,
+      "tokens": 0,
+      "provider": "none",
+      "path": "none",
+      "success": false,
+      "error": null
+    },
+    {
+      "kind": "technical",
+      "message": "What b-value does the DTI acquisition protocol use?",
+      "seconds": 3.57,
+      "rounds": 0,
+      "tools": 0,
+      "tokens": 0,
+      "provider": "none",
+      "path": "none",
+      "success": false,
+      "error": null
+    },
+    {
+      "kind": "technical",
+      "message": "How do I upload a scan to VoxelBox?",
+      "seconds": 3.65,
+      "rounds": 0,
+      "tools": 0,
+      "tokens": 0,
+      "provider": "none",
+      "path": "none",
+      "success": false,
+      "error": null
+    },
+    {
+      "kind": "technical",
+      "message": "What are the installation prerequisites for VoxelBox?",
+      "seconds": 3.71,
+      "rounds": 0,
+      "tools": 0,
+      "tokens": 0,
+      "provider": "none",
+      "path": "none",
+      "success": false,
+      "error": null
+    },
+    {
+      "kind": "data_lookup",
+      "message": "Which jobs are stuck in the registration stage?",
+      "seconds": 3.5,
+      "rounds": 0,
+      "tools": 0,
+      "tokens": 0,
+      "provider": "none",
+      "path": "none",
+      "success": false,
+      "error": null
+    },
+    {
+      "kind": "data_lookup",
+      "message": "How many scans failed this week?",
+      "seconds": 3.81,
+      "rounds": 0,
+      "tools": 0,
+      "tokens": 0,
+      "provider": "none",
+      "path": "none",
+      "success": false,
+      "error": null
+    }
+  ]
+}

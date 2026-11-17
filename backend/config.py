@@ -2,12 +2,15 @@
 Configuration Management for PingUs RAG Chatbot
 Loads and validates configuration from config.yaml
 """
+import logging
 import os
 import yaml
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -29,6 +32,7 @@ class ProviderConfig(BaseModel):
     timeout: int
     frequency_penalty: Optional[float] = 0.0
     presence_penalty: Optional[float] = 0.0
+    fallback_models: List[str] = Field(default_factory=list)
 
 class LLMConfig(BaseModel):
     default_provider: str
@@ -47,10 +51,19 @@ class TokenCountingConfig(BaseModel):
     encoding: str = Field(default="cl100k_base", description="Encoding for token counting")
     warning_threshold: float = Field(default=0.8, description="Warn at percentage of max_tokens")
 
+class RedisMemoryConfig(BaseModel):
+    key_prefix: str = Field(default="bsai:chat:session:")
+    connect_timeout_s: float = Field(default=0.5)
+    op_timeout_s: float = Field(default=0.5)
+    circuit_breaker_s: int = Field(default=30)
+
 class ConversationMemoryConfig(BaseModel):
     type: str = Field(default="buffer_window", description="Type of memory: buffer_window, summary, entity")
     buffer_window: BufferWindowConfig
     token_counting: TokenCountingConfig
+    backend: str = Field(default="in_process")
+    ttl_minutes: int = Field(default=60)
+    redis: RedisMemoryConfig = Field(default_factory=RedisMemoryConfig)
 
 class EmbeddingProviderConfig(BaseModel):
     model: str
@@ -156,6 +169,71 @@ class JobDBConfig(BaseModel):
     socket_timeout_ms: int = 10000
     max_pool_size: int = 20
 
+class MedicalGuardrailConfig(BaseModel):
+    enabled: bool = Field(default=True)
+    model: str = Field(default="gemini-3.5-flash-lite")
+    fallback_models: List[str] = Field(default_factory=list)
+    timeout_s: float = Field(default=10.0)
+    history_turns: int = Field(default=2)
+    on_error: str = Field(default="allow")
+    output_check: bool = Field(default=False)
+    canned_response: str = Field(
+        default=(
+            "I am an operational assistant for VoxelBox software and cannot provide "
+            "medical advice or evaluate symptoms. Please consult your physician."
+        )
+    )
+
+    @field_validator("timeout_s", mode="before")
+    @classmethod
+    def validate_timeout_s(cls, v: Any) -> float:
+        try:
+            val = float(v)
+            if val < 10.0:
+                logger.warning(
+                    "Medical guardrail timeout_s %.1fs is below Google minimum 10.0s; adjusting to 10.0s",
+                    val,
+                )
+                return 10.0
+            return val
+        except (ValueError, TypeError):
+            return 10.0
+
+class GuardrailsConfig(BaseModel):
+    medical: MedicalGuardrailConfig = Field(default_factory=MedicalGuardrailConfig)
+
+class AgentSettingsConfig(BaseModel):
+    max_iterations: int = Field(default=2)
+
+class FastPathRepliesConfig(BaseModel):
+    greeting: str = Field(
+        default="Hello! I can help with VoxelBox processing, MRI protocols, and job status. What do you need?"
+    )
+    thanks: str = Field(
+        default="You're welcome! Let me know if you need anything else with VoxelBox."
+    )
+    bye: str = Field(
+        default="Goodbye! Come back anytime you need help with VoxelBox."
+    )
+    out_of_scope: str = Field(
+        default="I'm the VoxelBox assistant, so I can only help with VoxelBox processing, MRI protocols, and job status. Is there something along those lines I can help with?"
+    )
+
+class FastPathConfig(BaseModel):
+    enabled: bool = Field(default=True)
+    replies: FastPathRepliesConfig = Field(default_factory=FastPathRepliesConfig)
+
+class PerformanceConfig(BaseModel):
+    parallel_gatekeeper: bool = Field(default=False)
+
+class PromptsConfig(BaseModel):
+    system: str = Field(default="system.md")
+    react_instructions: str = Field(default="react_instructions.md")
+
+class CitationsConfig(BaseModel):
+    verify: bool = Field(default=True)
+    titles: Dict[str, str] = Field(default_factory=dict)
+
 class Config(BaseModel):
     app: AppConfig
     llm: LLMConfig
@@ -165,10 +243,16 @@ class Config(BaseModel):
     documents: DocumentsConfig
     api: APIConfig
     logging: LoggingConfig
-    system_prompt: str
+    system_prompt: Optional[str] = None
+    prompts: PromptsConfig = Field(default_factory=PromptsConfig)
+    citations: CitationsConfig = Field(default_factory=CitationsConfig)
     monitoring: MonitoringConfig
     job_db: JobDBConfig = JobDBConfig()
     security: SecurityConfig = SecurityConfig()
+    guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig)
+    agent: AgentSettingsConfig = Field(default_factory=AgentSettingsConfig)
+    fast_path: FastPathConfig = Field(default_factory=FastPathConfig)
+    performance: PerformanceConfig = Field(default_factory=PerformanceConfig)
 
 # Global config instance
 _config: Optional[Config] = None
@@ -245,3 +329,35 @@ def get_job_db_config() -> JobDBConfig:
 def get_security_config() -> SecurityConfig:
     """Get security configuration"""
     return get_config().security
+
+
+def get_guardrails_config() -> GuardrailsConfig:
+    """Get guardrails configuration"""
+    return get_config().guardrails
+
+
+def get_prompts_config() -> PromptsConfig:
+    """Get prompts configuration"""
+    return get_config().prompts
+
+
+def get_citations_config() -> CitationsConfig:
+    """Get citations configuration"""
+    return get_config().citations
+
+
+def get_agent_config() -> AgentSettingsConfig:
+    """Get agent configuration"""
+    return get_config().agent
+
+
+def get_fast_path_config() -> FastPathConfig:
+    """Get fast path configuration"""
+    return get_config().fast_path
+
+
+def get_performance_config() -> PerformanceConfig:
+    """Get performance configuration"""
+    return get_config().performance
+
+

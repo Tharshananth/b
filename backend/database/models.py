@@ -1,5 +1,5 @@
 """Database models"""
-from sqlalchemy import Boolean, Column, String, Text, DateTime, Integer
+from sqlalchemy import Boolean, Column, Float, String, Text, DateTime, Integer
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
 import uuid
@@ -76,3 +76,102 @@ class DataAccessLog(Base):
     def __repr__(self):
         return (f"<DataAccessLog({self.timestamp} {self.tool_name} "
                 f"hospital={self.scope_hospital} n={self.record_count})>")
+
+
+class AdminUser(Base):
+    """Admin user account for backend administration"""
+    __tablename__ = 'admin_users'
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    username = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    role = Column(String, nullable=False, default="admin")
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_login = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<AdminUser(id={self.id}, username='{self.username}', role='{self.role}', active={self.is_active})>"
+
+
+class AdminActionLog(Base):
+    """Audit log of all admin operations"""
+    __tablename__ = 'admin_action_log'
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    username = Column(String, index=True, nullable=True)
+    action = Column(String, index=True, nullable=False)
+    target = Column(String, nullable=True)
+    succeeded = Column(Boolean, default=True, nullable=False)
+    detail = Column(Text, nullable=True)
+    client_ip = Column(String, nullable=True)
+
+    def __repr__(self):
+        return f"<AdminActionLog({self.timestamp} username='{self.username}' action='{self.action}' succeeded={self.succeeded})>"
+
+
+
+class GuardrailEvent(Base):
+    """
+    One row per guardrail check (input and optionally output).
+
+    Does NOT store question or answer text — message_id links to
+    FeedbackInteraction which already holds the full exchange.
+    """
+    __tablename__ = "guardrail_events"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    # Request identity — no PII content
+    session_id = Column(String, nullable=False, index=True)
+    user_id = Column(String, nullable=False, index=True)
+    message_id = Column(String, nullable=False, index=True)
+
+    # Guardrail result — no question or answer text
+    stage = Column(String, nullable=False)          # "input" | "output"
+    category = Column(String, nullable=True)        # Category value or NULL on error
+    decision = Column(String, nullable=False)       # "blocked" | "allowed" | "error"
+    reason = Column(Text, nullable=True)
+    latency_ms = Column(Float, nullable=False)
+    model = Column(String, nullable=True)
+    error = Column(Text, nullable=True)
+
+    def __repr__(self):
+        return (
+            f"<GuardrailEvent({self.timestamp} stage={self.stage} "
+            f"decision={self.decision} category={self.category})>"
+        )
+
+
+class RequestMetric(Base):
+    """
+    Per-request latency, cost, and routing metrics.
+    Never stores message text.
+    """
+    __tablename__ = "request_metrics"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    message_id = Column(String, nullable=False, index=True)
+    session_id = Column(String, nullable=False, index=True)
+    path = Column(String, nullable=False, index=True)
+    total_ms = Column(Float, nullable=False)
+    guardrail_ms = Column(Float, nullable=True)
+    agent_ms = Column(Float, nullable=True)
+    llm_calls = Column(Integer, default=0, nullable=False)
+    agent_rounds = Column(Integer, default=0, nullable=False)
+    tokens = Column(Integer, nullable=True)
+    cached_tokens = Column(Integer, nullable=True)
+    provider = Column(String, nullable=True)
+    model_used = Column(String, nullable=True)
+    prompt_version = Column(String, nullable=True)
+    parallel = Column(Boolean, default=False, nullable=False)
+
+    def __repr__(self):
+        return (
+            f"<RequestMetric({self.timestamp} path='{self.path}' "
+            f"total_ms={self.total_ms:.1f} llm_calls={self.llm_calls})>"
+        )
+

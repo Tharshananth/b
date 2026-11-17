@@ -2,13 +2,23 @@
 from pathlib import Path
 from typing import List, Optional
 import logging
-from langchain_core.documents import Document  # ← FIXED
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    Docx2txtLoader,
-    TextLoader,
-    UnstructuredMarkdownLoader
-)
+try:
+    from langchain_core.documents import Document
+    from langchain_community.document_loaders import (
+        PyPDFLoader,
+        Docx2txtLoader,
+        TextLoader,
+        UnstructuredMarkdownLoader,
+    )
+except ImportError:
+    from dataclasses import dataclass, field as _field
+
+    @dataclass
+    class Document:  # type: ignore[no-redef]
+        page_content: str = ""
+        metadata: dict = _field(default_factory=dict)
+
+    PyPDFLoader = Docx2txtLoader = TextLoader = UnstructuredMarkdownLoader = None  # type: ignore[assignment]
 from config import get_config
 
 logger = logging.getLogger(__name__)

@@ -19,7 +19,41 @@ except ImportError:
 from config import get_config
 from .embeddings import get_embeddings
 
+__all__ = ["VectorStore", "Document", "distance_to_cosine"]
+
 logger = logging.getLogger(__name__)
+
+# Tracks spaces we've already warned about to avoid log spam
+_WARNED_UNKNOWN_SPACE: set = set()
+
+
+def distance_to_cosine(distance: float, space: str) -> float:
+    """Convert a Chroma distance value to cosine similarity in [0.0, 1.0].
+
+    Chroma with 'l2' space stores SQUARED L2 distance.
+    For unit-length vectors: cosine_similarity = 1 - sq_l2 / 2.
+
+    Args:
+        distance: Raw distance value returned by Chroma.
+        space: The HNSW distance space ('l2', 'cosine', or 'ip').
+
+    Returns:
+        Cosine similarity clamped to [0.0, 1.0].
+    """
+    if space == "l2":
+        cosine = 1.0 - distance / 2.0
+    elif space in ("cosine", "ip"):
+        cosine = 1.0 - distance
+    else:
+        if space not in _WARNED_UNKNOWN_SPACE:
+            _WARNED_UNKNOWN_SPACE.add(space)
+            logger.warning(
+                "Unknown Chroma distance space %r; using l2 formula. "
+                "Set collection_metadata={'hnsw:space': 'l2'|'cosine'|'ip'}.",
+                space,
+            )
+        cosine = 1.0 - distance / 2.0
+    return max(0.0, min(1.0, cosine))
 
 class VectorStore:
     """Vector store for document storage and retrieval with hybrid search"""
@@ -38,7 +72,15 @@ class VectorStore:
             embedding_function=self.embeddings,
             persist_directory=self.persist_directory
         )
-        
+
+        # Read distance space once from collection metadata (default "l2")
+        try:
+            _meta = self.vectordb._collection.metadata or {}
+            self._distance_space = _meta.get("hnsw:space", "l2")
+        except Exception:
+            self._distance_space = "l2"
+        logger.info("Vector store distance space: %s", self._distance_space)
+
         # Initialize text splitter
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.config.vector_db.chunking.chunk_size,
@@ -157,16 +199,17 @@ class VectorStore:
         # ── 1. Dense Semantic Search (with score filtering) ──────────────
         vector_docs = []
         try:
-            vector_results = self.vectordb.similarity_search_with_relevance_scores(
+            vector_results = self.vectordb.similarity_search_with_score(
                 query=query,
                 k=k
             )
-            for doc, score in vector_results:
-                if score >= threshold:
-                    doc.metadata["retrieval_score"] = round(float(score), 4)
+            for doc, distance in vector_results:
+                cosine = distance_to_cosine(float(distance), self._distance_space)
+                if cosine >= threshold:
+                    doc.metadata["retrieval_score"] = round(cosine, 4)
                     doc.metadata["retrieval_method"] = "vector"
                     vector_docs.append(doc)
-            
+
             logger.info(
                 f"Vector search returned {len(vector_results)} results, "
                 f"{len(vector_docs)} passed threshold ({threshold})"
@@ -241,13 +284,16 @@ class VectorStore:
                 query=query,
                 k=k
             )
-            
-            # Filter by score threshold
-            filtered = [
-                (doc, score) for doc, score in results
-                if score >= score_threshold
-            ]
-            
+
+            # Convert distances to cosine similarity and filter (highest cosine = most similar)
+            filtered = []
+            for doc, distance in results:
+                cosine = distance_to_cosine(float(distance), self._distance_space)
+                if cosine >= score_threshold:
+                    filtered.append((doc, cosine))
+
+            # Sort by cosine similarity, highest first
+            filtered.sort(key=lambda x: x[1], reverse=True)
             return filtered
         except Exception as e:
             logger.error(f"Search with score error: {e}")

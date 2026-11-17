@@ -53,7 +53,8 @@ class LLMFactory:
                     temperature=provider_config.temperature,
                     max_tokens=provider_config.max_tokens,
                     top_p=provider_config.top_p,
-                    timeout=provider_config.timeout
+                    timeout=provider_config.timeout,
+                    fallback_models=getattr(provider_config, "fallback_models", []),
                 )
                 
                 self._providers[provider_name] = provider
@@ -109,6 +110,7 @@ class LLMFactory:
         system_prompt: Optional[str] = None,
         preferred_provider: Optional[str] = None,
         tools: Optional[List] = None,
+        tool_choice: Optional[str] = None,
         **kwargs
     ) -> LLMResponse:
         """
@@ -121,11 +123,14 @@ class LLMFactory:
             tools: Tool definitions. When given, only providers that support
                 tools are eligible - falling back onto one that silently drops
                 them would produce a confident answer with no data behind it.
+            tool_choice: Optional tool choice mode (e.g. "none")
             **kwargs: Additional parameters
 
         Returns:
             LLMResponse from the first successful provider
         """
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
         # Build provider order
         providers_to_try = []
 
@@ -167,27 +172,97 @@ class LLMFactory:
         # Try providers in order
         last_error = None
         for provider_name in providers_to_try:
-            try:
-                provider = self._providers[provider_name]
-                logger.info(f"Trying provider: {provider_name}")
+            provider = self._providers[provider_name]
+            logger.info(f"Trying provider: {provider_name}")
 
-                response = provider.generate_response(
-                    messages=messages,
-                    system_prompt=system_prompt,
-                    **kwargs
+            if provider_name == "gemini" and hasattr(provider, "candidate_models"):
+                from .model_health import (
+                    get_cooldown_for_exception,
+                    mark_ok,
+                    mark_unavailable,
                 )
-                
-                if response.finish_reason != "error":
-                    logger.info(f" Success with {provider_name}")
-                    return response
-                
-                last_error = response.error
-                logger.warning(f"Provider {provider_name} returned error: {response.error}")
-                
-            except Exception as e:
-                last_error = str(e)
-                logger.error(f"Provider {provider_name} failed: {e}")
-                continue
+
+                preferred_model = kwargs.get("model")
+                allow_model_fallback = kwargs.get("allow_model_fallback", True)
+
+                if preferred_model and not allow_model_fallback:
+                    models_to_try = [preferred_model]
+                elif preferred_model:
+                    models_to_try = provider.candidate_models(preferred_model=preferred_model)
+                else:
+                    models_to_try = provider.candidate_models()
+
+                call_kwargs = {
+                    k: v for k, v in kwargs.items()
+                    if k not in ("model", "allow_model_fallback")
+                }
+
+                for candidate_model in models_to_try:
+                    try:
+                        logger.info("Trying Gemini model: %s", candidate_model)
+                        response = provider.generate_response(
+                            messages=messages,
+                            system_prompt=system_prompt,
+                            model=candidate_model,
+                            **call_kwargs,
+                        )
+
+                        if response.finish_reason != "error":
+                            mark_ok(candidate_model)
+                            logger.info(f" Success with Gemini model: {candidate_model}")
+                            return response
+
+                        last_error = response.error
+                        logger.warning(
+                            "Gemini model '%s' returned error: %s",
+                            candidate_model,
+                            response.error,
+                        )
+                    except Exception as e:
+                        cooldown = get_cooldown_for_exception(e)
+                        if cooldown:
+                            mark_unavailable(candidate_model, cooldown[0], cooldown[1])
+                            last_error = str(e)
+                            logger.warning(
+                                "Gemini model '%s' hit cooldown (%s); trying next candidate",
+                                candidate_model,
+                                cooldown[1],
+                            )
+                            continue
+                        else:
+                            # On other errors (e.g. 400, 401, 403): stop and return the error, as today
+                            logger.error(
+                                "Gemini model '%s' failed with non-cooldown error: %s",
+                                candidate_model,
+                                e,
+                            )
+                            last_error = str(e)
+                            return LLMResponse(
+                                content="I apologize, but I encountered an error processing your request. Please try again.",
+                                model=candidate_model,
+                                provider="gemini",
+                                finish_reason="error",
+                                error=str(e),
+                            )
+            else:
+                try:
+                    response = provider.generate_response(
+                        messages=messages,
+                        system_prompt=system_prompt,
+                        **kwargs
+                    )
+                    
+                    if response.finish_reason != "error":
+                        logger.info(f" Success with {provider_name}")
+                        return response
+                    
+                    last_error = response.error
+                    logger.warning(f"Provider {provider_name} returned error: {response.error}")
+                    
+                except Exception as e:
+                    last_error = str(e)
+                    logger.error(f"Provider {provider_name} failed: {e}")
+                    continue
         
         # All providers failed
         error_msg = f"All providers failed. Last error: {last_error}"
